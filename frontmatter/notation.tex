@@ -1,10 +1,215 @@
+% frontmatter/notation.tex
+% Notation for the Parallel DFS chapter.
+
+% Give every ppbox a blank line between its label and its body.
+\tcbset{ppbox/.append style={after title={\par\smallskip}}}
+
 \chapter*{Notation}
 \addcontentsline{toc}{chapter}{Notation}
 
+\begin{ppkey}
+This page collects the symbols introduced in the Parallel Depth-First
+Search chapter.  Entries are grouped by topic; within each group every
+symbol is given its own definition box so the page can be skimmed by
+eye when chasing down an unfamiliar piece of notation.
+\end{ppkey}
+
+%--------------------------------------------------------------
+\section*{Asymptotic notation and basic mathematics}
+%--------------------------------------------------------------
+
 \begin{ppdefn}
-\ppterm{Speedup} is $S = T_1 / T_p$, where $T_1$ is serial time and $T_p$ is parallel time.
+\ppterm{Big-$\mathcal{O}$ notation} is an asymptotic upper bound:
+$g(n) \in \mathcal{O}(f(n))$ if $|g(n)| \le c\,|f(n)|$ for some
+constant $c$ and all sufficiently large $n$.
 \end{ppdefn}
 
-\begin{ppkey}
-Always separate \ppterm{algorithmic parallelism} from \ppterm{implementation overheads}.
-\end{ppkey}
+\begin{ppdefn}
+\ppterm{Logarithm} $\log n$ denotes the base-2 logarithm by default.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Set cardinality} $|S|$ is the number of elements in the finite
+set $S$.  In particular $|C_i|$ is the number of vertices in
+component $C_i$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Assignment} $\leftarrow$ means ``the variable on the left is
+updated to the value on the right''.
+\end{ppdefn}
+
+%--------------------------------------------------------------
+\section*{Graphs and trees}
+%--------------------------------------------------------------
+
+\begin{ppdefn}
+\ppterm{Input graph} $G$ is a connected undirected graph; $n$ is the
+number of vertices and $m$ the number of edges.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Edge} $(u, v)$ is an undirected edge between vertices $u$ and
+$v$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Directed arc} $u \to v$ is a directed arc from $u$ to $v$,
+used for the arcs produced by an Euler tour of an undirected tree.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Edge weight} $w$ is the weight of an edge, written inline as
+$(u, v)\,w{=}k$ in worked examples.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Root} $r$ is the root of a rooted spanning tree.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Spanning tree} $S$ is a spanning tree of $G$, specifically the
+(minimum) spanning tree built by the parallel Bor{\r u}vka rounds.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{DFS tree} $T$ is a DFS tree.  We write $T_i$ for the local
+DFS tree of component $C_i$, and reserve ``the merged DFS tree'' for
+the global tree assembled in Step~5.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Parent pointer} $\texttt{parent[v]}$ is the parent of $v$ in
+a rooted tree, treated as an array indexed by vertex id.
+\end{ppdefn}
+
+%--------------------------------------------------------------
+\section*{Disjoint-set (Union-Find) operations}
+%--------------------------------------------------------------
+
+\begin{ppdefn}
+\ppterm{Find} $\texttt{Find}(u)$ returns the representative (root) of
+the set currently containing $u$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Union} $\texttt{Union}(u, v)$ merges the sets containing $u$
+and $v$ into a single set.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Pointer-jumping update} is the parallel assignment
+$\texttt{parent[v]} \leftarrow \texttt{parent[parent[v]]}$.  Iterated
+until a fixed point, it flattens any rooted forest in
+$\mathcal{O}(\log n)$ rounds.
+\end{ppdefn}
+
+%--------------------------------------------------------------
+\section*{Spine and off-spine components}
+%--------------------------------------------------------------
+
+\begin{ppdefn}
+\ppterm{Spine} $P$ is the chosen root-to-leaf path in the spanning
+tree, taken as the longest such path.  Written as a sequence
+$s_0 \to s_1 \to \cdots \to s_d$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Spine vertex} $s_k$ is the spine vertex at position $k$ along
+$P$.  $s_0$ is the root and $s_d$ the deepest leaf of the spanning
+tree.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Spine depth} $d$ is the depth of a spine vertex along $P$;
+written next to a vertex as ``spine $d{=}k$''.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Off-spine component} $C_i$ is the $i$-th connected component
+of the graph induced when spine vertices are removed.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Component root} $\mathrm{root}_i$ is the
+deterministically-chosen entry vertex of $C_i$, used as the root of
+the recursive DFS call into $C_i$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Off-spine parent} $\texttt{off\_parent[v]}$ is the auxiliary
+parent pointer used to find off-spine components by parallel pointer
+jumping.  At initialisation,
+$\texttt{off\_parent[v]} = \texttt{parent[v]}$ if
+$\texttt{parent[v]}$ is also off-spine, and
+$\texttt{off\_parent[v]} = v$ otherwise.
+\end{ppdefn}
+
+%--------------------------------------------------------------
+\section*{Euler tour and list ranking}
+%--------------------------------------------------------------
+
+\begin{ppdefn}
+\ppterm{Next pointer} $\texttt{next}(u \to v)$ is the arc that follows
+$u \to v$ in the Euler tour of the spanning tree, used as the
+``next'' pointer for parallel list ranking.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Down-arc} is an arc $u \to v$ where $v$ is a child of $u$ in
+the rooted tree.  Down-arcs contribute $+1$ to the depth-counting
+prefix sum.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Up-arc} is an arc $v \to u$ where $u$ is the parent of $v$
+(a return arc).  Up-arcs contribute $0$ to the depth-counting prefix
+sum.
+\end{ppdefn}
+
+%--------------------------------------------------------------
+\section*{Tree merging and edge classification}
+%--------------------------------------------------------------
+
+\begin{ppdefn}
+\ppterm{Global DFS number} $\mathrm{dfs}[v]$ is the pre-order number
+assigned to vertex $v$ in the merged DFS tree.  For a spine vertex
+$s_k$:
+$\mathrm{dfs}[s_k] = k + \sum_{j < k} \mathrm{block\_size}[s_j]$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Subtree size} $\mathrm{size}[v]$ is the number of vertices in
+the subtree rooted at $v$ in the merged DFS tree.  Used together with
+$\mathrm{dfs}[v]$ to test ancestor--descendant relations in
+$\mathcal{O}(1)$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Block size} $\mathrm{block\_size}[s_j]$ is the size $|C_j|$
+of the component hanging off spine vertex $s_j$ (zero if no component
+hangs there).
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Tree edge} is an edge that belongs to the merged DFS tree.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Back edge} is a non-tree edge $(u, v)$ such that one endpoint
+is an ancestor of the other in the merged DFS tree.  In a valid DFS
+tree of an undirected graph, every non-tree edge is a back edge.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Forward edge} is, in a directed graph, a non-tree edge
+$(u, v)$ where $v$ is a descendant of $u$ in the DFS tree.  Detected
+by $\mathrm{dfs}[u] < \mathrm{dfs}[v]$ and
+$\mathrm{dfs}[v] \le \mathrm{dfs}[u] + \mathrm{size}[u] - 1$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Cross edge} is a non-tree edge joining two vertices that are
+neither ancestor nor descendant of each other.  In a valid undirected
+DFS tree, no such non-tree edge exists.
+\end{ppdefn}
