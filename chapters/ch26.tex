@@ -1,0 +1,950 @@
+% ch26.tex  --  Parallel Depth-First Search
+% Transcribed from: Lec 26 -- Parallel Algorithms (Subodh Sharma, April 24, 2026)
+
+% Give every ppbox a blank line between its label and its body.
+\tcbset{ppbox/.append style={after title={\par\smallskip}}}
+
+\chapter{Parallel Depth-First Search}
+
+%------------------------------------------------------------------
+% Learning outcomes
+%------------------------------------------------------------------
+\begin{ppkey}
+After studying this chapter you should be able to:
+\begin{itemize}
+  \item Explain why DFS is intrinsically hard to parallelise and why a
+        naive parallel expansion loses the depth-first property.
+  \item Describe a depth biased work-pool parallel search and state what it does and
+        does \emph{not} guarantee about the resulting tree.
+  \item Outline the divide-and-conquer parallel DFS strategy: spine
+        extraction, off-spine components, attachment, recursion, and
+        merging.
+  \item Apply parallel Kruskal's algorithm with Bor{\r u}vka rounds,
+        including parallel deduplication, Union-Find with pointer
+        jumping, and cross-component edge detection.
+  \item Construct an Euler tour of a tree in parallel and use parallel
+        list ranking via prefix sum to recover node depths.
+  \item Identify off-spine components and attach each one to the correct spine
+        vertex using a deterministic rule.
+  \item Merge per-component DFS trees into one global DFS tree by
+        computing global DFS numbers via parallel prefix sum.
+  \item Classify non-tree edges as forward, back, or cross edges in
+        $\mathcal{O}(1)$ per edge using DFS-number intervals.
+    \item Understand the difference between parallel graph traversal and a verified DFS tree.
+\end{itemize}
+\end{ppkey}
+
+%==================================================================
+\section{Introduction}
+%==================================================================
+\begin{ppdefn}
+A \ppterm{valid DFS tree} of a connected graph $G$ rooted at a vertex
+$r$ is a rooted spanning tree $T$ of $G$ such that there exists a
+sequential DFS execution starting from $r$ whose tree edges are exactly
+the edges of $T$.
+ 
+Equivalently, $T$ is a valid DFS tree if and only if every non-tree
+edge of $G$ joins some node to one of its ancestors in $T$, that
+is, every non-tree edge is a \emph{back edge}.  No non-tree edge of an
+undirected graph may connect two nodes that are neither ancestor nor
+descendant of each other.
+% For directed graphs the definition admits two further non-tree edge
+% types --- forward and cross edges --- and the classification carried
+% out at the merge step (Section~\ref{sec:dfs-merge}) handles all three
+% cases uniformly.
+\end{ppdefn}
+Depth-First Search is a workhorse of sequential graph algorithms: it
+underpins biconnectivity, strongly connected components, topological
+sort, and many shortest-path and matching algorithms.
+Sequentially it is trivial; in parallel it is one of the harder
+graph problems.
+This chapter develops a parallel DFS that produces a valid DFS tree by
+combining several primitives: parallel sort and
+scan, parallel Union-Find with pointer jumping, Euler tours, and
+parallel list ranking.  The treatment follows the textbook development
+in~\cite{grama2003,kumar1994}.
+
+Three obstacles make DFS resist parallelisation:
+\begin{itemize}
+  \item \textbf{Long sequential chains from depth exploration.}
+        Each recursive call depends on the discovery state produced by
+        the previous one, so the critical path is essentially a chain
+        of node visits.
+  \item \textbf{Constructing a valid DFS tree is hard.}
+        A DFS tree is not just any spanning tree; it must be one that a
+        sequential DFS could have produced.
+  \item \textbf{Constructing a \emph{specific} DFS order is even harder.}
+        The DFS stack can be shared across processors but orderings such as ``smallest numbered neighbour first'' will require the algorithm to know whether the smallest neighbour's subtree has finished. This creates a long dependence chain
+\end{itemize}
+
+\begin{ppexample}
+Consider the small graph
+\[
+  A \to \{B, C\}, \qquad B \to \{D, E\}.
+\]
+A naive ``parallel DFS'' that expands all unvisited neighbours of $A$
+simultaneously discovers $B$ and $C$ in the same step.
+A sequential DFS, by contrast, would explore the entire subtree rooted
+at $B$ (so $D$ and $E$) before ever touching $C$.
+The parallel discovery pattern is no longer depth-first; it is just a
+parallel traversal that happens to cover the graph.
+We have given up the very property we wanted to preserve.
+\end{ppexample}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.36\textwidth]{col380-book/chapters/figures/fig-naive-tree.jpg}
+  \caption{The toy tree used in the naive-traversal argument.
+           Expanding $B$ and $C$ in parallel from $A$ destroys the
+           depth-first discovery order.}
+  \label{fig:dfs-naive-tree}
+\end{figure}
+
+%==================================================================
+\section{Work-Pool Parallel Search}
+%==================================================================
+
+Before attempting a ``proper'' parallel DFS, we record a practical
+compromise: a depth-biased parallel search using a shared work pool.
+The output is not guaranteed to be a strict DFS tree, but the
+construction is simple, scalable, and a useful starting point for
+applications that mainly need a spanning tree biased toward
+depth~\cite{pacheco2011}.
+
+\begin{ppdefn}
+\ppterm{Work-pool parallel search} maintains a shared stack (or bag) of
+frontier vertices.  Many processors repeatedly do the following:
+\begin{enumerate}
+  \item Remove a vertex $u$ from the bag.
+  \item Inspect $u$'s adjacency list.
+  \item For each unvisited neighbour $v$, atomically attempt to mark
+        $v$ as visited.
+  \item If the mark succeeds, set \texttt{parent[v] = u} and insert
+        $v$ into the bag.
+\end{enumerate}
+\end{ppdefn}
+
+Atomic marking ensures each vertex is claimed by exactly one processor,
+so \texttt{parent[]} defines a valid spanning tree of the connected
+component reached from the start vertex.
+
+\begin{pppitfall}
+A work-pool search returns a spanning tree, not a DFS tree.
+The order in which vertices come out of the bag depends on processor
+scheduling and contention, so a sequential DFS could not, in general,
+have produced the same tree. The resultant parent tree may violate the DFS ancestor descendant property.
+\end{pppitfall}
+
+%==================================================================
+\section{Divide-and-Conquer Parallel DFS}
+\label{sec:dfs-divide-conquer}
+%==================================================================
+
+The remainder of the chapter develops a divide-and-conquer parallel DFS
+that does produce a valid DFS tree.
+The strategy is to identify a single root-to-leaf path of the DFS
+tree, called the \ppterm{spine}, and then recurse independently on the
+components that hang off it.
+
+\begin{ppdefn}
+The \ppterm{spine} of a DFS tree is a path from the root to a leaf
+that we commit to in advance, before recursive subtrees are computed.
+In the construction below, the spine is the longest root-to-leaf path
+in a (minimum) spanning tree of the graph.
+\end{ppdefn}
+
+\begin{ppnote}
+The high-level steps are:
+\begin{enumerate}
+  \item Identify a path that acts as the spine of the DFS tree.
+  \item Find the connected components hanging off the spine.
+  \item Assign each component to an attachment vertex on the spine.
+  \item Recursively compute DFS trees of the components in parallel.
+  \item Merge the recursive trees into one global DFS tree.
+  \item Verify the DFS property, if needed.
+\end{enumerate}
+Steps 1 and 5 carry most of the algorithmic content; steps 2--4 are
+bookkeeping built on parallel Union-Find.
+\end{ppnote}
+
+%==================================================================
+\section{Step 1a: Computing the Spine via a Spanning Tree}
+\label{sec:dfs-spanning}
+%==================================================================
+
+The spine is extracted from a (minimum) spanning tree of the input
+graph.
+We compute the spanning tree in parallel using a Bor{\r u}vka-style
+algorithm; the lecture slides label it ``parallel Kruskal'' because
+edges are processed in non-decreasing weight order, but the per-round
+component contraction is pure Bor{\r u}vka~\cite{grama2003,kumar1994}.
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.85\textwidth]{col380-book/chapters/figures/fig-input-graph.jpg}
+  \caption{The running example used throughout the chapter.  Vertices
+           $\{A, B, C, D, E, F\}$ with weighted undirected edges; the
+           same graph is referenced by every subsequent figure.}
+  \label{fig:dfs-input-graph}
+\end{figure}
+
+\subsection{Parallel Edge Sort}
+
+Sort the edge list by weight in parallel using parallel merge sort.
+Local chunks of size $E/p$ can be sorted in
+$\mathcal{O}\!\bigl(\frac{E}{p}\log\frac{E}{p}\bigr)$ time, and the
+merge reduction combines them in $\mathcal{O}(\log p)$ rounds.
+
+\begin{ppexample}
+Take the unsorted array $[38, 27, 43, 3, 9, 82, 10, 19]$ split across
+two threads.  After local sort:
+\begin{align*}
+  T_1 : [38, 27, 43, 3]      &\;\longrightarrow\; [3, 27, 38, 43], \\
+  T_2 : [9,\; 82,\; 10,\; 19] &\;\longrightarrow\; [9, 10, 19, 82].
+\end{align*}
+A parallel merge then combines the two sorted runs into one.
+The merge step itself runs in parallel:
+\begin{enumerate}
+  \item Pick the median of the larger array $A$, say $A[\mathrm{mid}]$.
+  \item Binary-search the position $k$ in $B$ where $A[\mathrm{mid}]$
+        would fit.
+  \item This yields four segments: the left/right halves of $A$ around
+        $\mathrm{mid}$ and the left/right halves of $B$ around $k$.
+  \item Concurrently, processor $P_1$ recursively merges the left
+        halves and $P_2$ recursively merges the right halves.
+\end{enumerate}
+\end{ppexample}
+
+\subsection{Bor{\r u}vka Rounds for Spanning-Tree Construction}
+
+Initially every vertex is its own single-vertex component, owned by one
+processor.  In each round we do the following in parallel:
+\begin{itemize}
+  \item Every component finds its minimum-weight outgoing edge.
+  \item The selected edges are de-duplicated (two components can pick
+        the same edge from opposite ends).
+  \item Components are contracted into super-vertices.
+\end{itemize}
+
+\begin{ppexample}
+Round~1 of Bor{\r u}vka on the graph from
+Section~\ref{sec:dfs-spanning} produces:
+\begin{center}
+\begin{tabular}{@{}clll@{}}
+\toprule
+Proc.\ & Component & Min outgoing edge \\
+\midrule
+$P_1$ & $\{A\}$ & $(A,C),\; w=2$ \\
+$P_2$ & $\{B\}$ & $(B,E),\; w=3$ \\
+$P_3$ & $\{C\}$ & $(A,C),\; w=2$ \quad (duplicate of $P_1$) \\
+$P_4$ & $\{D\}$ & $(B,D),\; w=6$ \\
+$P_5$ & $\{E\}$ & $(B,E),\; w=3$ \quad (duplicate of $P_2$) \\
+$P_6$ & $\{F\}$ & $(D,F),\; w=7$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Edges $(A,C)$ and $(B,E)$ are each selected by two processors and must
+be removed before contraction.
+\end{ppexample}
+
+% (The table above already shows the per-component selections; slide 8
+% in the lecture additionally highlights the duplicate selections in red.)
+
+\subsection{Parallel Deduplication}
+
+Duplicates are removed by sort + scan:
+\begin{enumerate}
+  \item Each undirected edge is normalised to a canonical form, e.g.\
+        the endpoint with the smaller vertex id is written first.
+  \item The list is sorted by this canonical key.
+  \item An exclusive prefix scan flags the first occurrence of each
+        edge; later copies are dropped.
+\end{enumerate}
+After deduplication on the running example we are left with
+\[
+  (A,C)\,w{=}2,\quad
+  (B,E)\,w{=}3,\quad
+  (B,D)\,w{=}6,\quad
+  (D,F)\,w{=}7.
+\]
+
+\subsection{Parallel Union-Find with Pointer Jumping}
+
+To contract the surviving edges into super-vertices we run a parallel
+Union-Find.
+
+\begin{ppdefn}
+A \ppterm{Union-Find} (or disjoint-set) data structure exposes two
+primitives:
+\begin{itemize}
+  \item \texttt{Find$(u)$} --- return the representative (root) of the
+        set containing $u$.
+  \item \texttt{Union$(u,v)$} --- merge the sets containing $u$ and $v$.
+\end{itemize}
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Pointer jumping} is a parallel technique in which every node's
+parent pointer is replaced by its \emph{grandparent}'s pointer:
+\[
+  \texttt{parent[v]} \;\leftarrow\; \texttt{parent[parent[v]]}.
+\]
+Applied in parallel by every processor and iterated until a fixed
+point, pointer jumping flattens any rooted forest in $\mathcal{O}(\log n)$
+rounds, after which one read of \texttt{parent[v]} returns the
+root~\cite{kumar1994}.
+\end{ppdefn}
+
+\begin{ppnote}
+The flattened Union-Find tree is used \emph{only} to identify roots; it
+does not preserve the original graph or tree structure.
+We will keep a separate \texttt{parent[]} array for the spanning tree
+itself.
+\end{ppnote}
+
+After the first round of Union-Find on our four de-duplicated edges,
+two components remain: $\{A,C\}$ rooted at $A$, and $\{B,D,E,F\}$
+rooted at $B$.
+The path from $F$ is compressed directly to $B$ during pointer jumping.
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.85\textwidth]{col380-book/chapters/figures/fig-uf-round1.jpg}
+  \caption{Two components after the first Union-Find round on the four
+           de-duplicated edges.  Component $\{A,C\}$ is rooted at $A$;
+           component $\{B,D,E,F\}$ is rooted at $B$.  The orange arrow
+           from $F$ to $B$ is the path-compressed pointer produced by
+           pointer jumping on edge $(D,F)$.}
+  \label{fig:dfs-uf-round1}
+\end{figure}
+
+\subsection{Cross-Component Edge Detection}
+
+After each round we still need to connect the surviving components.
+For every edge $(u,v)$ in the input, one processor checks in $\mathcal{O}(1)$
+whether the edge crosses components,
+\[
+  \texttt{Find}(u) \;\neq\; \texttt{Find}(v),
+\]
+and if so records $(u,v)$ together with its weight.
+A parallel min-reduction over the collected list selects the next
+minimum-weight inter-component edge.
+
+\begin{ppexample}
+For our running graph, the cross-edge selected in round 2 is $(A,B)$
+with $w=4$, which connects $\{A,C\}$ to $\{B,D,E,F\}$.
+After this round all six vertices belong to a single component and the
+spanning tree is complete:
+\[
+  S = \{(A,C), (A,B), (B,E), (B,D), (D,F)\}.
+\]
+\end{ppexample}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.85\textwidth]{col380-book/chapters/figures/fig-spanning-tree.jpg}
+  \caption{The spanning tree highlighted on the running graph.  Tree
+           edges $\{(A,C),(A,B),(B,E),(B,D),(D,F)\}$ are drawn solid
+           green; non-tree edges $\{(B,C),(C,D),(C,E),(E,F)\}$ are
+           dashed.}
+  \label{fig:dfs-spanning-tree}
+\end{figure}
+
+%==================================================================
+\section{Step 1b: Extracting the Root-to-Leaf Spine}
+\label{sec:dfs-spine}
+%==================================================================
+
+Given the spanning tree $S$, the spine is its longest root-to-leaf
+path.  We extract it in two stages: an Euler tour to linearise the
+tree, then parallel list ranking to recover depths.
+
+\subsection{Euler Tour Construction}
+
+\begin{ppdefn}
+An \ppterm{Euler tour} of a tree replaces each undirected tree edge
+$(u,v)$ with two directed arcs $u \to v$ and $v \to u$ and orders the
+arcs so that they trace the order in which a sequential DFS would
+follow them.  For each arc we compute a \texttt{next} pointer that
+points to the arc following it in the tour~\cite{grama2003}.
+\end{ppdefn}
+
+The \texttt{next} pointers obey two rules:
+\begin{itemize}
+  \item \textbf{Rule 1 (descend).} $\texttt{next}(u \to v)$ is the
+        first arc out of $v$ to $v$'s first child.
+        If $v$ is a leaf then $\texttt{next}(u \to v) = (v \to u)$:
+        the traversal returns immediately.
+  \item \textbf{Rule 2 (backtrack).} $\texttt{next}(v \to u)$ is the
+        next arc out of $u$ after $v$, that is, the arc to $u$'s next
+        child following $v$.  If $v$ was the last child of $u$ then
+        $\texttt{next}(v \to u) = (u \to \mathrm{parent}(u))$.
+  \item The tour terminates when the return arc from the root's last
+        child wraps back to the first arc out of the root.
+\end{itemize}
+
+This construction is purely local: each processor handles one arc and
+writes one pointer, so the directed-graph build is an $\mathcal{O}(1)$
+parallel computation per arc.
+
+\begin{ppexample}
+For the spanning tree of our running example, ordering children by
+ascending label and starting from $A$, the Euler tour produces the arc
+sequence
+\[
+\begin{aligned}
+A{\to}B,\; B{\to}D,\; D{\to}F,\; F{\to}D,\; D{\to}B,\\
+B{\to}E,\; E{\to}B,\; B{\to}A,\; A{\to}C,\; C{\to}A.
+\end{aligned}
+\]
+Down-arcs descend into a new child; up-arcs return to a parent.
+\end{ppexample}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.95\textwidth]{col380-book/chapters/figures/fig-euler-tour.jpg}
+  \caption{Euler tour of the spanning tree as an ordered list of
+           directed arcs (positions $0$--$9$).  Down-arcs (green) descend
+           into a new child; up-arcs (purple) return to a parent.}
+  \label{fig:dfs-euler-tour}
+\end{figure}
+
+\subsection{Parallel List Ranking via Prefix Sum}
+
+Each arc carries a contribution: $+1$ for a down-arc and $0$ for an
+up-arc.
+A parallel exclusive prefix sum over these contributions assigns every
+arc its position along a depth-counted ranking.
+Reading the down-arcs gives node depths, and the maximum depth
+identifies the deepest leaf.
+
+\begin{ppexample}
+On our running example, the prefix sum reveals that $F$ is the deepest
+leaf at depth~3.  Following parent pointers from $F$ back to the root
+recovers the spine
+\[
+  P \;=\; A \to B \to D \to F.
+\]
+Parent pointers can themselves be jumped in $\mathcal{O}(\log n)$ rounds, so
+the recovery is also parallel.
+\end{ppexample}
+
+% (Slide 15 in the lecture provides a two-row tabular view of the
+% list-ranking computation: the top row shows per-arc accumulators
+% and \texttt{next} pointers, the bottom row shows the prefix-sum
+% totals 4, 10, 17, 17, 17, 20, 20, 20, 22, 22.  The same data is
+% reproduced in Exercise 5.)
+
+\begin{ppnote}
+When components were merged during Bor{\r u}vka contraction, depths of
+nodes inside an absorbed component were incremented to reflect their
+new position in the larger tree.
+This depth bookkeeping is what allows the maximum-depth scan to identify
+$F$ as the deepest leaf in a single global pass.
+\end{ppnote}
+
+%==================================================================
+\section{Step 2: Components Hanging Off the Spine}
+%==================================================================
+
+With the spine $P = A \to B \to D \to F$ in hand, contract (or
+mark-as-removed) the spine vertices and find the connected components
+of the remaining off-spine sub-induced graph.
+The same parallel Union-Find with pointer jumping is used, but on an
+auxiliary parent relation.
+
+For each off-spine node $v$ we initialise
+\[
+  \texttt{off\_parent[v]} \;=\;
+  \begin{cases}
+    \texttt{parent[v]} & \text{if } \texttt{parent[v]} \text{ is also off-spine},\\
+    v                  & \text{otherwise (i.e.\ parent is on the spine)}.
+  \end{cases}
+\]
+Then in each round every processor simultaneously executes
+\[
+  \texttt{off\_parent[v]} \;\leftarrow\;
+    \texttt{off\_parent[\,off\_parent[v]\,]}.
+\]
+After $\mathcal{O}(\log n)$ rounds the auxiliary forest is flat, and every
+off-spine node knows its component root.
+
+\begin{ppexample}
+On the running graph, two singleton components emerge:
+$\mathrm{comp}_1 = \{C\}$ and $\mathrm{comp}_2 = \{E\}$.
+Their attaching cross-edges to the spine are $(A,C)$ and $(B,E)$
+respectively.
+\end{ppexample}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.85\textwidth]{col380-book/chapters/figures/fig-spine-components.jpg}
+  \caption{Spine $A \to B \to D \to F$ (orange) and the two off-spine
+           components $\mathrm{comp}_1 = \{C\}$ hanging off $A$ and
+           $\mathrm{comp}_2 = \{E\}$ hanging off $B$ (green dashed
+           edges).  Spine depths $d = 0, 1, 2, 3$ are labelled above
+           each spine vertex.}
+  \label{fig:dfs-spine-components}
+\end{figure}
+
+%==================================================================
+\section{Step 3: Component-to-Spine Attachment}
+%==================================================================
+
+A component may have edges to several spine vertices, so a deterministic
+rule must pick a unique attachment.
+
+\begin{ppdefn}
+We attach component $C_i$ to the \ppterm{deepest} spine vertex it
+connects to.  Algorithmically, we inspect all edges $(u, v_j)$ with
+$u \in C_i$ and $v_j \in P$, compute the maximum index $j$ in
+parallel, and attach $C_i$ to $v_j$.
+\end{ppdefn}
+
+\begin{ppnote}
+Attaching to the deepest reachable spine vertex (rather than the
+shallowest) keeps the merged DFS tree consistent with a sequential DFS
+that would have explored as deeply as possible before backtracking.
+A shallower attachment would force back-edges to become tree edges and
+violate DFS-tree invariants.
+\end{ppnote}
+
+%==================================================================
+\section{Step 4: Recursive DFS on Components}
+%==================================================================
+
+Each component $C_i$ rooted at its first entry vertex $\mathrm{root}_i$
+becomes an independent recursive sub-problem.  We invoke
+\texttt{DFS$(C_i, \mathrm{root}_i)$} on each one, and the recursive
+calls run in parallel because the components are disjoint by
+construction.
+
+\begin{ppnote}
+$\mathrm{root}_i$ can be picked deterministically: either the endpoint
+of the first edge in $C_i$'s adjacency list, or the smallest-labelled
+endpoint of the cross-edge that attaches $C_i$ to the spine.
+Either choice fixes a unique recursive root and is reproducible across
+runs.
+\end{ppnote}
+
+%==================================================================
+\section{Step 5: Parallel Tree Merging}
+\label{sec:dfs-merge}
+%==================================================================
+
+The recursion produces, for each $C_i$, a local DFS tree $T_i$ with its
+own local DFS numbering.  We now stitch them onto the spine to form one
+global DFS tree.
+
+\subsection{Merge Invariants}
+
+\begin{ppdefn}
+A correct DFS-tree merge preserves three invariants:
+\begin{description}
+  \item[I1.] Each attachment edge
+        $(\text{spine\_node} \to C_i\text{\_root})$ becomes a tree
+        edge of the merged DFS tree.
+  \item[I2.] DFS numbering respects pre-order: every spine node $s$
+        is numbered before all nodes in the components hanging off
+        $s$.
+  \item[I3.] Non-tree edges are classified as forward, back, or cross
+        edges using the DFS-number intervals of the merged tree.
+\end{description}
+\end{ppdefn}
+
+\subsection{Computing Global DFS Numbers}
+
+For each spine vertex $s_k$ we want:
+\begin{itemize}
+  \item the size of the component $C_i$ hanging off $s_k$, computed by
+        a parallel reduction in $\mathcal{O}(\log^2 n)$;
+  \item the global DFS number of $s_k$, given by
+        \[
+          \mathrm{dfs}[s_k]
+            \;=\; k \;+\; \sum_{j < k} \mathrm{block\_size}[s_j].
+        \]
+\end{itemize}
+
+The trick is to build an interleaved sequence whose slots alternate
+``spine node / hanging block''
+\[
+  \underbrace{s_0}_{1}\;
+  \underbrace{\text{block}(s_0)}_{|C_0|}\;
+  \underbrace{s_1}_{1}\;
+  \underbrace{\text{block}(s_1)}_{|C_1|}\;
+  \cdots
+\]
+Each spine slot contributes $1$, and each block slot contributes its
+component size (or $0$ if no component hangs off that spine vertex).
+A parallel exclusive prefix sum over this contribution array yields each
+slot's global DFS start number.
+
+\begin{ppexample}
+On our running graph the contribution array is
+$[1,1,1,1,1,0,1,0]$, with the zeros corresponding to the empty blocks
+under spine vertices $D$ and $F$.
+The prefix sum produces the merged pre-order
+\[
+  A_0,\quad C_1,\quad B_2,\quad E_3,\quad D_4,\quad F_5,
+\]
+where subscripts denote global DFS numbers.
+This satisfies invariants I1 and I2 by construction.
+\end{ppexample}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.7\textwidth]{col380-book/chapters/figures/fig-merge-preorder.jpg}
+  \caption{Merged DFS pre-order produced by the interleaved prefix sum
+           on the contribution array $[1,1,1,1,1,0,1,0]$.  Spine
+           vertices (orange) and off-spine vertices (green) are laid out
+           in the order they receive their global DFS numbers.}
+  \label{fig:dfs-merge-preorder}
+\end{figure}
+
+\subsection{Classifying Non-Tree Edges}
+
+Once every node has a global DFS number $\mathrm{dfs}[\cdot]$ and a
+subtree size $\mathrm{size}[\cdot]$, every non-tree edge $(u, v)$ in
+the original graph is classified in parallel and in $\mathcal{O}(1)$ per
+edge:
+
+\begin{ppdefn}
+For a non-tree edge $(u, v)$ in the merged DFS tree:
+\begin{description}
+  \item[Forward edge.]
+        $\mathrm{dfs}[u] < \mathrm{dfs}[v]$ \emph{and}
+        $\mathrm{dfs}[v] \le \mathrm{dfs}[u] + \mathrm{size}[u] - 1$.
+        ($v$ lies in $u$'s subtree.)
+  \item[Back edge.]
+        $\mathrm{dfs}[v] < \mathrm{dfs}[u]$ \emph{and}
+        $\mathrm{dfs}[u] \le \mathrm{dfs}[v] + \mathrm{size}[v] - 1$.
+        ($u$ is a descendant of $v$.)
+  \item[Cross edge.] Otherwise.
+\end{description}
+\end{ppdefn}
+
+This is invariant I3, expressed as a constant-time predicate over
+DFS-number intervals.
+Because every edge is classified independently, the whole non-tree edge
+classification is a single parallel pass.
+
+%==================================================================
+\section*{Key Takeaways}
+\addcontentsline{toc}{section}{Key Takeaways}
+%==================================================================
+
+\begin{ppnote}
+\begin{itemize}
+  \item \textbf{Naive parallel DFS fails} because expanding all unvisited
+        neighbours simultaneously discards the depth-first ordering we
+        wanted in the first place.
+  \item \textbf{Work-pool search} gives a depth-biased spanning tree
+        cheaply but does not produce a valid DFS tree.
+  \item \textbf{Divide-and-conquer DFS} extracts a spine, recurses on
+        off-spine components in parallel, and merges results.
+  \item \textbf{Parallel Kruskal/Bor{\r u}vka} builds the spanning tree
+        by repeatedly picking minimum-weight outgoing edges per
+        component, deduplicating with a parallel scan, and contracting
+        with parallel Union-Find.
+  \item \textbf{Pointer jumping} flattens any rooted forest in
+        $\mathcal{O}(\log n)$ rounds: $\texttt{parent[v]} \leftarrow
+        \texttt{parent[parent[v]]}$.
+  \item \textbf{Euler tour + list ranking} converts a tree into a
+        linear sequence with depth labels using only an
+        $\mathcal{O}(1)$-per-arc construction and one parallel prefix sum.
+  \item \textbf{The deepest-vertex attachment rule} is what keeps the
+        merged tree consistent with a sequential DFS; shallower
+        attachments would violate DFS-tree invariants.
+  \item \textbf{Tree merging} reduces to a single interleaved prefix sum
+        over $[\,1, |C_0|, 1, |C_1|, \ldots\,]$ that yields global DFS
+        numbers.
+  \item \textbf{Edge classification} is then $\mathcal{O}(1)$ per non-tree
+        edge using DFS-number intervals: forward, back, or cross.
+\end{itemize}
+\end{ppnote}
+
+%==================================================================
+\section{Exercises}
+%==================================================================
+
+\begin{ppexercises}
+
+\ppexercise{%
+\textbf{Why naive parallelism fails.}  Take the small tree
+$A \to \{B, C\}$ and $B \to \{D, E\}$ with the convention that
+sequential DFS visits the smaller-labelled child first.
+\begin{enumerate}[label=(\alph*)]
+  \item List the discovery order produced by sequential DFS.
+  \item List a possible discovery order if all unvisited neighbours of
+        the current frontier are expanded simultaneously.
+  \item Identify one tree edge produced by the naive parallel scheme
+        that could not appear in any valid DFS tree.
+\end{enumerate}
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item Sequential DFS: $A, B, D, E, C$.
+  \item Naive parallel: $A$, then $\{B, C\}$ together, then
+        $\{D, E\}$ together --- discovery order
+        $A, B, C, D, E$ (or with $B, C$ swapped).
+  \item In sequential DFS at $A$, after entering $B$ we must finish the
+        $B$-subtree before exploring $C$; therefore $C$ is discovered
+        from $A$ \emph{after} $D$ and $E$.  The naive parallel scheme
+        discovers $C$ at depth~1 \emph{before} $D$ and $E$, an
+        ordering no sequential DFS could produce.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Tracing Bor{\r u}vka rounds.}  On the graph of
+Section~\ref{sec:dfs-spanning}, perform the algorithm round by round.
+\begin{enumerate}[label=(\alph*)]
+  \item List each component's minimum-weight outgoing edge in round 1.
+  \item Identify the duplicate selections.
+  \item Show the contracted super-vertices after round 1.
+  \item Find the next cross-component edge selected in round 2.
+\end{enumerate}
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item $\{A\}{:}\,(A,C)\,2$,\;
+        $\{B\}{:}\,(B,E)\,3$,\;
+        $\{C\}{:}\,(A,C)\,2$,\;
+        $\{D\}{:}\,(B,D)\,6$,\;
+        $\{E\}{:}\,(B,E)\,3$,\;
+        $\{F\}{:}\,(D,F)\,7$.
+  \item $(A,C)$ and $(B,E)$ each appear twice.
+  \item Two super-vertices: $\{A,C\}$ and $\{B,D,E,F\}$.
+  \item Among edges crossing these two components --- $(A,B)\,4$,
+        $(B,C)\,5$, $(C,D)\,8$, $(C,E)\,10$ --- the minimum is
+        $(A,B)$ with $w=4$.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Pointer jumping.}  Suppose Union-Find currently has
+\[
+  \texttt{parent} = [A,A,B,A,B,B], \qquad
+  \text{indices } [A,B,C,D,E,F],
+\]
+where $\texttt{parent[X]}$ is the parent of $X$ (so $\texttt{parent[A]}=A$
+means $A$ is a root).  Apply pointer jumping until a fixed point.
+\begin{enumerate}[label=(\alph*)]
+  \item State the parent array after one parallel round.
+  \item State the parent array after the round at which a fixed point
+        is reached.
+  \item Why does the fixed point identify the root of each component?
+\end{enumerate}
+
+\textbf{Solution.}
+The initial array is already shallow: every non-root has its grandparent
+equal to its parent (every parent is itself a root).
+\begin{enumerate}[label=(\alph*)]
+  \item After one round, $\texttt{parent}$ is unchanged --- a fixed
+        point is reached immediately.
+  \item Same as (a): $[A,A,B,A,B,B]$.
+  \item At the fixed point, $\texttt{parent[parent[v]]} = \texttt{parent[v]}$
+        for every $v$, which means $\texttt{parent[v]}$ is its own root.
+        A single read of $\texttt{parent[v]}$ now returns the component
+        root in $\mathcal{O}(1)$.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Euler tour next pointers.}  Take the rooted tree on $\{A,B,C\}$
+where $A$ is the root with children $B$ and $C$ (in that order).
+\begin{enumerate}[label=(\alph*)]
+  \item List the four directed arcs of the Euler tour.
+  \item For each arc, give its $\texttt{next}$ pointer using Rules 1
+        and 2.
+  \item Verify that the tour terminates correctly when the return arc
+        from the last child wraps back to the first arc out of the
+        root.
+\end{enumerate}
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item Arcs: $A{\to}B$, $B{\to}A$, $A{\to}C$, $C{\to}A$.
+  \item Pointers:
+        \begin{itemize}
+          \item $\texttt{next}(A{\to}B)$: $B$ is a leaf, so by Rule~1
+                it is $B{\to}A$.
+          \item $\texttt{next}(B{\to}A)$: $B$ is not the last child of
+                $A$ (next child is $C$), so by Rule~2 it is $A{\to}C$.
+          \item $\texttt{next}(A{\to}C)$: $C$ is a leaf, so by Rule~1
+                it is $C{\to}A$.
+          \item $\texttt{next}(C{\to}A)$: $C$ is the last child of the
+                root, so by Rule~2 the tour terminates.
+        \end{itemize}
+  \item The arc sequence is $A{\to}B,\,B{\to}A,\,A{\to}C,\,C{\to}A$.
+        After $C{\to}A$ there is no further arc, which is the
+        termination condition for the root's last child.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{List ranking for depth.}  Suppose an Euler tour is encoded as a
+sequence of contributions $[1, 1, 1, 0, 0, 1, 0, 0, 1, 0]$ (1 for a
+down-arc, 0 for an up-arc).  Assume each down-arc enters a node whose
+label appears in order $B, D, F, \cdot, \cdot, E, \cdot, \cdot, C,
+\cdot$ (dots are up-arcs).
+\begin{enumerate}[label=(\alph*)]
+  \item Apply an exclusive prefix sum to obtain depth labels.
+  \item Identify the deepest leaf and its depth.
+  \item State the recovered root-to-leaf path.
+\end{enumerate}
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item Exclusive prefix sum:
+        $[0, 1, 2, 3, 3, 3, 4, 4, 4, 5]$.
+        The values at down-arc positions give the discovery depth
+        (offset by 1) of each new node.
+  \item The maximum depth among down-arcs is $3$, attained at the
+        down-arc that discovers $F$.  So $F$ is the deepest leaf at
+        depth $3$.
+  \item Recovering parents from $F$ gives $F \to D \to B \to A$, so
+        the spine is $A \to B \to D \to F$.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Off-spine components via \texttt{off\_parent}.}  Suppose the
+spanning tree has $\texttt{parent}[X]$ as follows:
+$\texttt{parent}[B]=A$, $\texttt{parent}[C]=A$, $\texttt{parent}[D]=B$,
+$\texttt{parent}[E]=B$, $\texttt{parent}[F]=D$, with $A$ as the root.
+The spine is $\{A, B, D, F\}$.
+\begin{enumerate}[label=(\alph*)]
+  \item Initialise $\texttt{off\_parent}$ for every off-spine node.
+  \item Apply one round of pointer jumping.
+  \item State the off-spine components.
+\end{enumerate}
+
+\textbf{Solution.}
+The off-spine nodes are $\{C, E\}$.
+
+\begin{enumerate}[label=(\alph*)]
+
+\item \texttt{parent[C]} = $A$ is on the spine, so
+\[
+\texttt{off\_parent[C]} = C.
+\]
+\texttt{parent[E]} = $B$ is on the spine, so
+\[
+\texttt{off\_parent[E]} = E.
+\]
+
+\item One round:
+\[
+\begin{aligned}
+\texttt{off\_parent[C]} 
+&= \texttt{off\_parent[off\_parent[C]]} \\
+&= \texttt{off\_parent[C]} \\
+&= C.
+\end{aligned}
+\]
+Similarly for $E$. Already at a fixed point.
+
+\item Each off-spine node is its own root, giving two singleton
+components $\{C\}$ and $\{E\}$.
+
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Edge classification by intervals.}  After merging, suppose
+\[
+\begin{aligned}
+\mathrm{dfs} &= \{A{:}0, C{:}1, B{:}2, E{:}3, D{:}4, F{:}5\}, \\
+\mathrm{size} &= \{A{:}6, C{:}1, B{:}4, E{:}1, D{:}2, F{:}1\}.
+\end{aligned}
+\]
+Classify the following non-tree edges as forward, back, or cross:
+$(A, D)$, $(D, A)$, $(C, E)$, $(E, F)$.
+
+\textbf{Solution.}
+\begin{itemize}
+  \item $(A,D)$: $\mathrm{dfs}[A]=0<\mathrm{dfs}[D]=4$ and
+        $4 \le 0 + 6 - 1 = 5$.  \textbf{Forward.}
+  \item $(D,A)$: $\mathrm{dfs}[A]=0<\mathrm{dfs}[D]=4$ and
+        $4 \le 0 + 6 - 1 = 5$.  \textbf{Back} ($D$ is a descendant of $A$).
+  \item $(C,E)$: $\mathrm{dfs}[C]=1<\mathrm{dfs}[E]=3$ but
+        $3 \not\le 1 + 1 - 1 = 1$, so not forward.  Symmetric check
+        also fails.  \textbf{Cross.}
+  \item $(E,F)$: $\mathrm{dfs}[E]=3<\mathrm{dfs}[F]=5$ but
+        $5 \not\le 3 + 1 - 1 = 3$, so not forward.  Symmetric check
+        also fails.  \textbf{Cross.}
+\end{itemize}
+}
+
+\ppexercise{%
+\textbf{Why deepest, not shallowest?}  Suppose component $C_i$ has
+edges to spine vertices $s_1$ (depth 1) and $s_3$ (depth 3).
+\begin{enumerate}[label=(\alph*)]
+  \item Argue informally that attaching $C_i$ to $s_3$ is consistent
+        with a sequential DFS that has already descended to $s_3$
+        before recursing into $C_i$.
+  \item Show that attaching $C_i$ to $s_1$ would force the edge
+        $(s_3, C_i)$ to violate the DFS-tree invariant in
+        Section~\ref{sec:dfs-merge}.
+\end{enumerate}
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item A sequential DFS from the root walks down $s_0, s_1, s_2, s_3$
+        before backtracking.  At $s_3$ it sees an edge into $C_i$ and
+        descends into the component.  When it later climbs back through
+        $s_2, s_1, s_0$, the edge $(s_1, C_i)$ is already a back-edge
+        from a node already visited, not a new tree edge.  Attaching
+        $C_i$ at $s_3$ matches this picture.
+  \item If we instead attached $C_i$ at $s_1$, then $(s_1, C_i)$ would
+        be the tree edge.  But during the sequential DFS, $s_3$ is
+        already on the spine and $C_i$ is reachable from $s_3$ before
+        we ever return to $s_1$.  The edge $(s_3, C_i)$ would have to
+        be a forward edge from $s_3$ \emph{into} $C_i$'s subtree, which
+        contradicts I3 because $C_i$'s DFS interval would lie outside
+        $s_3$'s subtree interval.
+\end{enumerate}
+}
+
+\end{ppexercises}
+
+%==================================================================
+\section*{References}
+\addcontentsline{toc}{section}{References}
+%==================================================================
+
+The following sources were used in preparing this chapter.  Each is
+cited at the points in the chapter where its treatment was drawn on
+most directly.
+
+\begin{itemize}
+  \item A.~Grama, G.~Karypis, V.~Kumar, and A.~Gupta,
+        \emph{Introduction to Parallel Computing}, 2nd~ed.
+        Addison-Wesley, 2003.~\cite{grama2003}
+        \\ \emph{Used for:} the parallel
+        Bor{\r u}vka/Kruskal spanning-tree construction
+        (Section~\ref{sec:dfs-spanning}) and the Euler-tour technique
+        for tree linearisation (Section~\ref{sec:dfs-spine}).
+  \item V.~Kumar, A.~Grama, A.~Gupta, and G.~Karypis,
+        \emph{Introduction to Parallel Computing: Design and Analysis
+        of Algorithms}.
+        Benjamin/Cummings, 1994.~\cite{kumar1994}
+        \\ \emph{Used for:} the divide-and-conquer parallel-DFS
+        framework, parallel Union-Find with pointer jumping, and
+        parallel list ranking via prefix sum.
+  \item P.~Pacheco, \emph{An Introduction to Parallel Programming}.
+        Morgan Kaufmann, 2011.~\cite{pacheco2011}
+        \\ \emph{Used for:} the practical work-pool/shared-bag
+        formulation of depth-biased parallel search in
+        Section~2 (``Work-Pool Parallel Search'').
+\end{itemize}
+
+%==================================================================
+\section*{Contributor}
+\addcontentsline{toc}{section}{Contributor}
+%==================================================================
+
+\begin{ppnote}
+Transcribed by \textbf{Priyanka Sar}, Entry No.\ \textbf{2023CS50578}
+\end{ppnote}
